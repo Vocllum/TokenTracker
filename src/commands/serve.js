@@ -452,6 +452,22 @@ function isTokenTrackerServeCommand(command) {
   return false;
 }
 
+async function isHealthyTokenTrackerServer(port) {
+  try {
+    const http = require("node:http");
+    return await new Promise((resolve) => {
+      const req = http.get("http://127.0.0.1:" + port + "/api/local-auth", { timeout: 1500 }, (res) => {
+        res.resume();
+        resolve(res.statusCode === 200);
+      });
+      req.on("error", () => resolve(false));
+      req.on("timeout", () => { req.destroy(); resolve(false); });
+    });
+  } catch (_e) {
+    return false;
+  }
+}
+
 async function ensurePortFree(port) {
   const pids = findPidOnPort(port);
   if (pids.length === 0) return;
@@ -464,6 +480,14 @@ async function ensurePortFree(port) {
     (pid) => pid !== self && isTokenTrackerServeCommand(readProcessCommand(pid)),
   );
   if (targets.length === 0) return;
+
+  // If a verified TokenTracker server is already healthy on this port, exit smoothly
+  // instead of killing it. This prevents fratricide loops and connection drops
+  // when wake/health-checks or multiple CLI invocations run concurrently.
+  if (await isHealthyTokenTrackerServer(port)) {
+    process.stdout.write(`TokenTracker is already active and healthy on port ${port}. Exiting duplicate server smoothly.\n`);
+    process.exit(0);
+  }
 
   process.stdout.write(`Stopping previous server on port ${port} (pid ${targets.join(", ")})...\n`);
   for (const pid of targets) {
