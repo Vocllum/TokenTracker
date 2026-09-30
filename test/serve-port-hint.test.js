@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const cp = require("node:child_process");
 const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
@@ -255,20 +256,133 @@ test("port scan is limited to listeners, not everything touching the port", () =
   assert.match(source, /"-sTCP:LISTEN"/);
 });
 
+function hasLsof() {
+  try {
+    cp.execFileSync("lsof", ["-v"], { stdio: "ignore", timeout: 5000 });
+    return true;
+  } catch (_e) {
+    return false;
+  }
+}
+
+function createHealthyServeFixture(root) {
+  const binDir = path.join(root, "bin");
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(root, "package.json"),
+    JSON.stringify({ name: NPM_PACKAGE_NAME }),
+  );
+  const entry = path.join(binDir, "tracker.js");
+  fs.writeFileSync(
+    entry,
+    [
+      'const http = require("node:http");',
+      'const args = process.argv.slice(2);',
+      'const portIndex = args.indexOf("--port");',
+      'const port = portIndex >= 0 ? Number(args[portIndex + 1]) : 0;',
+      'const server = http.createServer((req, res) => {',
+      '  if (req.url === "/api/local-auth") {',
+      '    res.writeHead(200, { "Content-Type": "application/json" });',
+      '    res.end(JSON.stringify({ token: "fixture" }));',
+      '    return;',
+      '  }',
+      '  res.writeHead(404);',
+      '  res.end();',
+      '});',
+      'server.listen(port, "127.0.0.1", () => {',
+      '  process.stdout.write(String(server.address().port) + "\\n");',
+      '});',
+    ].join("\n"),
+  );
+  return entry;
+}
+
+async function spawnHealthyServeFixture(entry, port = 0) {
+  const child = cp.spawn(
+    process.execPath,
+    [entry, "serve", "--port", String(port)],
+    { stdio: ["ignore", "pipe", "ignore"] },
+  );
+  const reportedPort = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("fixture server never reported a port")), 10000);
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.stdout.once("data", (chunk) => {
+      clearTimeout(timer);
+      resolve(Number(String(chunk).trim()));
+    });
+  });
+  return { child, port: reportedPort };
+}
+
+async function waitForChildExit(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("fixture server did not exit")), 10000);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+test("ensurePortFree reuses a healthy server from the same installation", async (t) => {
+  if (!hasLsof()) return t.skip("requires lsof");
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tt-serve-same-install-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const entry = createHealthyServeFixture(root);
+  const { child, port } = await spawnHealthyServeFixture(entry);
+  t.after(() => child.kill("SIGKILL"));
+
+  let requestedExit = null;
+  await ensurePortFree(port, {
+    currentPackageRoot: root,
+    exitFn: (code) => { requestedExit = code; },
+  });
+
+  assert.equal(requestedExit, 0, "a same-install healthy duplicate should exit successfully");
+  assert.equal(child.exitCode, null, "the existing same-install server must remain alive");
+  assert.equal(child.signalCode, null, "the existing same-install server must not be signalled");
+  assert.equal(await canBind(port), false, "the original server should still own the port");
+});
+
+test("ensurePortFree replaces a healthy server from a stale installation", async (t) => {
+  if (!hasLsof()) return t.skip("requires lsof");
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tt-serve-stale-install-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const oldRoot = path.join(root, "old");
+  const newRoot = path.join(root, "new");
+  const oldEntry = createHealthyServeFixture(oldRoot);
+  const newEntry = createHealthyServeFixture(newRoot);
+
+  const oldServer = await spawnHealthyServeFixture(oldEntry);
+  t.after(() => oldServer.child.kill("SIGKILL"));
+
+  let requestedExit = false;
+  await ensurePortFree(oldServer.port, {
+    currentPackageRoot: newRoot,
+    exitFn: () => { requestedExit = true; },
+  });
+  await waitForChildExit(oldServer.child);
+
+  assert.equal(requestedExit, false, "a stale installation must not trigger duplicate success");
+  assert.equal(await canBind(oldServer.port), true, "cleanup should release the stale server port");
+
+  const replacement = await spawnHealthyServeFixture(newEntry, oldServer.port);
+  t.after(() => replacement.child.kill("SIGKILL"));
+  assert.equal(replacement.port, oldServer.port, "the new installation should take over the same port");
+});
+
 // Proves ensurePortFree consults the identity check rather than merely owning
 // one: a unit test of isTokenTrackerServeCommand alone still passes if the
 // filter is deleted from the kill path.
 test("ensurePortFree leaves an unrelated listener running", async (t) => {
-  const cp = require("node:child_process");
-  const hasLsof = (() => {
-    try {
-      cp.execFileSync("lsof", ["-v"], { stdio: "ignore", timeout: 5000 });
-      return true;
-    } catch (_e) {
-      return false;
-    }
-  })();
-  if (!hasLsof) return t.skip("ensurePortFree is a no-op without lsof");
+  if (!hasLsof()) return t.skip("ensurePortFree is a no-op without lsof");
 
   // A separate process, because ensurePortFree skips its own pid for free.
   const child = cp.spawn(
