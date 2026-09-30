@@ -21,6 +21,16 @@ const DEFAULT_PORT = 7680;
 const WSL_DEFAULT_PORT = 7681;
 const DEFAULT_MAX_PORT_ATTEMPTS = 20;
 const NPM_PACKAGE_NAME = "tokentracker-cli";
+const CURRENT_PACKAGE_VERSION = (() => {
+  try {
+    const manifest = JSON.parse(
+      fssync.readFileSync(path.resolve(__dirname, "..", "..", "package.json"), "utf8"),
+    );
+    return typeof manifest?.version === "string" ? manifest.version.trim() : "";
+  } catch (_e) {
+    return "";
+  }
+})();
 const LOCAL_BIND_HOST = "127.0.0.1";
 const NATIVE_BACKGROUND_SYNC_INTERVAL_MS = 60_000;
 const STATIC_ASSET_EXTENSIONS = new Set([
@@ -135,7 +145,14 @@ async function cmdServe(argv) {
   }
 
   // 3. Create handler
-  const handleApi = createLocalApiHandler({ queuePath });
+  const handleApi = createLocalApiHandler({
+    queuePath,
+    // Snapshot the package version at process start. If this installation is
+    // upgraded in place while an old server is still alive, that old process
+    // keeps reporting its old runtime version instead of reading the new
+    // package.json from disk.
+    serverVersion: CURRENT_PACKAGE_VERSION,
+  });
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -478,16 +495,51 @@ function isTokenTrackerServeCommand(command) {
   return Boolean(resolveTokenTrackerPackageRoot(command));
 }
 
-async function isHealthyTokenTrackerServer(port) {
+async function isHealthyTokenTrackerServer(port, expectedVersion = CURRENT_PACKAGE_VERSION) {
+  if (!expectedVersion) return false;
   try {
-    const http = require("node:http");
     return await new Promise((resolve) => {
-      const req = http.get("http://127.0.0.1:" + port + "/api/local-auth", { timeout: 1500 }, (res) => {
-        res.resume();
-        resolve(res.statusCode === 200);
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      const req = http.get(
+        "http://127.0.0.1:" + port + "/api/local-auth",
+        { timeout: 1500 },
+        (res) => {
+          if (res.statusCode !== 200) {
+            res.resume();
+            finish(false);
+            return;
+          }
+
+          let body = "";
+          res.setEncoding("utf8");
+          res.on("data", (chunk) => {
+            body += chunk;
+            if (body.length > 4096) {
+              req.destroy();
+              finish(false);
+            }
+          });
+          res.on("end", () => {
+            try {
+              const payload = JSON.parse(body);
+              finish(payload?.serverVersion === expectedVersion);
+            } catch (_e) {
+              finish(false);
+            }
+          });
+          res.on("error", () => finish(false));
+        },
+      );
+      req.on("error", () => finish(false));
+      req.on("timeout", () => {
+        req.destroy();
+        finish(false);
       });
-      req.on("error", () => resolve(false));
-      req.on("timeout", () => { req.destroy(); resolve(false); });
     });
   } catch (_e) {
     return false;
