@@ -6,6 +6,8 @@ const os = require("node:os");
 const path = require("node:path");
 const { test } = require("node:test");
 
+const CURRENT_PACKAGE_VERSION = require("../package.json").version;
+
 const {
   buildPortInUseHint,
   isPortUnavailableError,
@@ -265,7 +267,7 @@ function hasLsof() {
   }
 }
 
-function createHealthyServeFixture(root) {
+function createHealthyServeFixture(root, serverVersion = CURRENT_PACKAGE_VERSION) {
   const binDir = path.join(root, "bin");
   fs.mkdirSync(binDir, { recursive: true });
   fs.writeFileSync(
@@ -283,7 +285,7 @@ function createHealthyServeFixture(root) {
       'const server = http.createServer((req, res) => {',
       '  if (req.url === "/api/local-auth") {',
       '    res.writeHead(200, { "Content-Type": "application/json" });',
-      '    res.end(JSON.stringify({ token: "fixture" }));',
+      `    res.end(JSON.stringify({ token: "fixture", serverVersion: ${JSON.stringify(serverVersion)} }));`,
       '    return;',
       '  }',
       '  res.writeHead(404);',
@@ -376,6 +378,32 @@ test("ensurePortFree replaces a healthy server from a stale installation", async
   const replacement = await spawnHealthyServeFixture(newEntry, oldServer.port);
   t.after(() => replacement.child.kill("SIGKILL"));
   assert.equal(replacement.port, oldServer.port, "the new installation should take over the same port");
+});
+
+test("ensurePortFree replaces an old runtime after an in-place upgrade", async (t) => {
+  if (!hasLsof()) return t.skip("requires lsof");
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tt-serve-in-place-upgrade-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const entry = createHealthyServeFixture(root, "0.0.0-stale");
+  const oldServer = await spawnHealthyServeFixture(entry);
+  t.after(() => oldServer.child.kill("SIGKILL"));
+
+  let requestedExit = false;
+  await ensurePortFree(oldServer.port, {
+    currentPackageRoot: root,
+    exitFn: () => { requestedExit = true; },
+  });
+  await waitForChildExit(oldServer.child);
+
+  assert.equal(requestedExit, false, "an old runtime at the same path must be replaced");
+
+  // Simulate the package files being overwritten in place by an update.
+  createHealthyServeFixture(root, CURRENT_PACKAGE_VERSION);
+  const replacement = await spawnHealthyServeFixture(entry, oldServer.port);
+  t.after(() => replacement.child.kill("SIGKILL"));
+  assert.equal(replacement.port, oldServer.port);
 });
 
 // Proves ensurePortFree consults the identity check rather than merely owning
