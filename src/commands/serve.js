@@ -59,6 +59,14 @@ function getLocalServerUrl(port) {
 async function cmdServe(argv) {
   const opts = parseArgs(argv);
 
+  // An explicit port may already belong to this exact installation (for
+  // example a duplicate CLI launch or a native wake/retry). Detect that before
+  // init/sync/runtime repair so the duplicate is a true no-op.
+  if (opts.portExplicit && await isHealthySameInstallation(opts.port)) {
+    writeHealthyDuplicateNotice(opts.port);
+    return;
+  }
+
   // 0. First-time setup: if tracker dir doesn't exist, run init first
   const { trackerDir, binDir } = await resolveTrackerPaths();
   if (!fssync.existsSync(path.join(trackerDir, "cursors.json"))) {
@@ -424,32 +432,50 @@ function isTrackerPackageRoot(dir) {
   }
 }
 
+function normalizePackageRoot(dir) {
+  try {
+    return fssync.realpathSync(dir);
+  } catch (_e) {
+    return path.resolve(dir);
+  }
+}
+
+const CURRENT_PACKAGE_ROOT = normalizePackageRoot(path.resolve(__dirname, "..", ".."));
+
 // The path shape alone is not identifying: plenty of unrelated projects ship a
 // `bin/tracker.js`, and matching on that would signal one of them. Resolve the
 // script and require a real `${NPM_PACKAGE_NAME}` package around it.
 //
+// Return the resolved package root as well as proving identity. A healthy
+// TokenTracker from another installation is still stale from the perspective
+// of a newly launched bundled/native copy and must be replaceable.
+//
 // Fails closed. A server whose script cannot be resolved -- deleted, or in a
 // mount namespace this process cannot read -- is left alone, so the worst case
 // is a failed bind rather than a killed stranger.
-function isTokenTrackerServeCommand(command) {
+function resolveTokenTrackerPackageRoot(command) {
   const script = parseServeScriptPath(command);
-  if (!script) return false;
+  if (!script) return null;
 
   let resolved;
   try {
     resolved = fssync.realpathSync(script);
   } catch (_e) {
-    return false;
+    return null;
   }
 
   let dir = path.dirname(path.dirname(resolved));
   for (let depth = 0; depth < TRACKER_PACKAGE_SEARCH_DEPTH; depth++) {
-    if (isTrackerPackageRoot(dir)) return true;
+    if (isTrackerPackageRoot(dir)) return normalizePackageRoot(dir);
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
   }
-  return false;
+  return null;
+}
+
+function isTokenTrackerServeCommand(command) {
+  return Boolean(resolveTokenTrackerPackageRoot(command));
 }
 
 async function isHealthyTokenTrackerServer(port) {
@@ -468,29 +494,55 @@ async function isHealthyTokenTrackerServer(port) {
   }
 }
 
-async function ensurePortFree(port) {
-  const pids = findPidOnPort(port);
-  if (pids.length === 0) return;
-
-  // Only stop a verified TokenTracker server. `--port` may name a port owned by
-  // an unrelated application, and failing to bind is far safer than terminating
-  // a process merely because it happens to hold that port.
+function tokenTrackerTargetsOnPort(port) {
   const self = process.pid;
-  const targets = pids.filter(
-    (pid) => pid !== self && isTokenTrackerServeCommand(readProcessCommand(pid)),
+  return findPidOnPort(port)
+    .filter((pid) => pid !== self)
+    .map((pid) => ({
+      pid,
+      packageRoot: resolveTokenTrackerPackageRoot(readProcessCommand(pid)),
+    }))
+    .filter((target) => target.packageRoot);
+}
+
+async function isHealthySameInstallation(port, currentPackageRoot = CURRENT_PACKAGE_ROOT) {
+  const expectedRoot = normalizePackageRoot(currentPackageRoot);
+  const hasSameInstallation = tokenTrackerTargetsOnPort(port)
+    .some((target) => target.packageRoot === expectedRoot);
+  return hasSameInstallation && await isHealthyTokenTrackerServer(port);
+}
+
+function writeHealthyDuplicateNotice(port) {
+  process.stdout.write(
+    `TokenTracker is already active and healthy on port ${port}. Exiting duplicate server smoothly.\n`,
   );
+}
+
+async function ensurePortFree(
+  port,
+  {
+    currentPackageRoot = CURRENT_PACKAGE_ROOT,
+    exitFn = (code) => process.exit(code),
+  } = {},
+) {
+  const targets = tokenTrackerTargetsOnPort(port);
   if (targets.length === 0) return;
 
-  // If a verified TokenTracker server is already healthy on this port, exit smoothly
-  // instead of killing it. This prevents fratricide loops and connection drops
-  // when wake/health-checks or multiple CLI invocations run concurrently.
-  if (await isHealthyTokenTrackerServer(port)) {
-    process.stdout.write(`TokenTracker is already active and healthy on port ${port}. Exiting duplicate server smoothly.\n`);
-    process.exit(0);
+  // Reuse only a healthy server from this exact installation. Another
+  // TokenTracker package may be an older global/native bundle; the desktop apps
+  // intentionally replace those so an update cannot keep serving stale code.
+  const expectedRoot = normalizePackageRoot(currentPackageRoot);
+  if (
+    targets.some((target) => target.packageRoot === expectedRoot)
+    && await isHealthyTokenTrackerServer(port)
+  ) {
+    writeHealthyDuplicateNotice(port);
+    exitFn(0);
+    return;
   }
 
-  process.stdout.write(`Stopping previous server on port ${port} (pid ${targets.join(", ")})...\n`);
-  for (const pid of targets) {
+  process.stdout.write(`Stopping previous server on port ${port} (pid ${targets.map((target) => target.pid).join(", ")})...\n`);
+  for (const { pid } of targets) {
     try {
       process.kill(pid, "SIGTERM");
     } catch (_e) {}
@@ -504,7 +556,7 @@ async function ensurePortFree(port) {
 
   // Re-check identity before escalating: the pid may have exited during the
   // wait above and been recycled by an unrelated process.
-  for (const pid of targets) {
+  for (const { pid } of targets) {
     if (!isTokenTrackerServeCommand(readProcessCommand(pid))) continue;
     try {
       process.kill(pid, "SIGKILL");
@@ -677,9 +729,11 @@ module.exports = {
   getLocalServerUrl,
   parseArgs,
   ensurePortFree,
+  isHealthySameInstallation,
   isRunningUnderWsl,
   isTokenTrackerServeCommand,
   parseServeScriptPath,
+  resolveTokenTrackerPackageRoot,
   resolveDefaultPort,
   shouldServeSpaFallback,
   startNativeBackgroundSync,
