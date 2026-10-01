@@ -93,6 +93,17 @@ async function canBind(port) {
   }
 }
 
+async function getFreePort() {
+  const server = http.createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const port = server.address().port;
+  await closeServer(server);
+  return port;
+}
+
 test("serve respects explicit port from --port and PORT env", (t) => {
   mockPlatform(t, "darwin");
   assert.deepEqual(parseArgs([], { PORT: "7700" }), {
@@ -329,6 +340,100 @@ async function waitForChildExit(child) {
     });
   });
 }
+
+async function waitForLocalAuth(port, expectedVersion) {
+  const deadline = Date.now() + 15000;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    try {
+      const payload = await new Promise((resolve, reject) => {
+        const req = http.get(
+          `http://127.0.0.1:${port}/api/local-auth`,
+          { timeout: 1000 },
+          (res) => {
+            let body = "";
+            res.setEncoding("utf8");
+            res.on("data", (chunk) => { body += chunk; });
+            res.on("end", () => {
+              try {
+                resolve({ statusCode: res.statusCode, body: JSON.parse(body) });
+              } catch (error) {
+                reject(error);
+              }
+            });
+          },
+        );
+        req.on("error", reject);
+        req.on("timeout", () => req.destroy(new Error("health check timeout")));
+      });
+      if (payload.statusCode === 200 && payload.body?.serverVersion === expectedVersion) return;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`real serve process never became healthy: ${lastError?.message || "timeout"}`);
+}
+
+function collectChildOutput(child) {
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.on("data", (chunk) => { stdout += String(chunk); });
+  child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+  return {
+    get stdout() { return stdout; },
+    get stderr() { return stderr; },
+  };
+}
+
+test("real serve entry exits duplicate cleanly without replacing the first process", async (t) => {
+  if (!hasLsof()) return t.skip("requires lsof");
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "tt-real-serve-duplicate-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const trackerDir = path.join(home, ".tokentracker", "tracker");
+  fs.mkdirSync(trackerDir, { recursive: true });
+  fs.writeFileSync(path.join(trackerDir, "cursors.json"), "{}\n");
+
+  const port = await getFreePort();
+  const entry = path.join(__dirname, "..", "bin", "tracker.js");
+  const env = {
+    ...process.env,
+    HOME: home,
+    USERPROFILE: home,
+    TOKENTRACKER_SKIP_LOCAL_RUNTIME_COPY: "1",
+  };
+  const args = [entry, "serve", "--port", String(port), "--no-sync", "--no-open"];
+
+  const first = cp.spawn(process.execPath, args, {
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const firstOutput = collectChildOutput(first);
+  t.after(() => {
+    if (first.exitCode === null && first.signalCode === null) first.kill("SIGKILL");
+  });
+
+  await waitForLocalAuth(port, CURRENT_PACKAGE_VERSION);
+  assert.equal(first.exitCode, null, `first serve exited early: ${firstOutput.stderr}`);
+
+  const second = cp.spawn(process.execPath, args, {
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const secondOutput = collectChildOutput(second);
+  await waitForChildExit(second);
+
+  assert.equal(second.exitCode, 0, `duplicate serve failed: ${secondOutput.stderr}`);
+  assert.match(
+    secondOutput.stdout,
+    new RegExp(`already active and healthy on port ${port}\\. Exiting duplicate server smoothly\\.`),
+  );
+  assert.equal(first.exitCode, null, "the first real serve process must remain alive");
+  assert.equal(first.signalCode, null, "the first real serve process must not be signalled");
+  assert.equal(await canBind(port), false, "the first real serve process should still own the port");
+});
 
 test("ensurePortFree reuses a healthy server from the same installation", async (t) => {
   if (!hasLsof()) return t.skip("requires lsof");
