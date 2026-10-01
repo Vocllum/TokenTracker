@@ -72,10 +72,12 @@ test("local device metadata exposes the system name separately from machine iden
   assert.doesNotMatch(getSystemDeviceName() || "", /^Token Tracker .*#/u);
 });
 
-test("local auth reports the serve runtime version when provided", async () => {
+test("local auth reports the serve runtime version when provided", async (t) => {
   const { createLocalApiHandler } = require("../src/lib/local-api");
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tt-local-auth-version-"));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
   const handler = createLocalApiHandler({
-    queuePath: path.join(os.tmpdir(), "tokentracker-runtime-version-test.jsonl"),
+    queuePath: path.join(tempDir, "queue.jsonl"),
     serverVersion: "1.2.3-test",
   });
   const req = createRequest({ method: "GET" });
